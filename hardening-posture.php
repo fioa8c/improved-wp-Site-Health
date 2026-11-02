@@ -27,6 +27,9 @@ final class HP_Prototype {
 	/** display_errors as PHP had it before this plugin touched it. */
 	private $display_errors_base;
 
+	/** The REST closer, kept so effective_open() can check it is still hooked. */
+	private $rest_closer;
+
 	public static function boot(): self {
 		if ( ! self::$instance ) {
 			self::$instance = new self();
@@ -100,7 +103,7 @@ final class HP_Prototype {
 		return array(
 			'file_editor'      => array(
 				'label'     => __( 'Theme and plugin file editor' ),
-				'why'       => __( 'Lets administrators edit theme and plugin PHP from the dashboard. Closed, a stolen admin login cannot be turned into code running on the server.' ),
+				'why'       => __( 'Lets administrators edit theme and plugin PHP from the dashboard. Closed, a stolen admin login cannot edit the PHP already on the server. To stop it uploading new code as well, also close installing plugins, themes and updates below.' ),
 				'link'      => 'https://developer.wordpress.org/apis/wp-config-php/#disable-the-plugin-and-theme-file-editor',
 				'constant'  => 'DISALLOW_FILE_EDIT',
 				'base_open' => $this->constant_open( 'DISALLOW_FILE_EDIT' ),
@@ -108,7 +111,7 @@ final class HP_Prototype {
 			),
 			'file_mods'        => array(
 				'label'       => __( 'Installing plugins, themes and updates from the dashboard' ),
-				'why'         => __( 'Lets the dashboard install, update and delete plugins and themes. Closed, new code can only arrive through your deployment process.' ),
+				'why'         => __( 'Lets the dashboard install, update and delete plugins and themes. Closed, new code can only arrive through your deployment process, so a stolen admin login cannot upload a plugin to run its own PHP.' ),
 				'link'        => 'https://developer.wordpress.org/apis/wp-config-php/#disable-plugin-and-theme-update-and-installation',
 				'constant'    => 'DISALLOW_FILE_MODS',
 				'base_open'   => $this->constant_open( 'DISALLOW_FILE_MODS' ),
@@ -129,24 +132,28 @@ final class HP_Prototype {
 				'why'       => __( 'The legacy remote-publishing API used by older apps and some services. Closed, it stops the password-guessing and amplification attacks that still target it.' ),
 				'link'      => 'https://developer.wordpress.org/apis/xml-rpc/',
 				'base_open' => $this->without_enforcement( static fn() => (bool) apply_filters( 'xmlrpc_enabled', true ) ),
+				'live'      => static fn() => (bool) apply_filters( 'xmlrpc_enabled', true ),
 			),
 			'app_passwords'    => array(
 				'label'     => __( 'Application passwords' ),
 				'why'       => __( 'Lets users mint extra passwords so apps and scripts can call the REST API. Closed, nothing can quietly create a lasting credential after a break-in.' ),
 				'link'      => 'https://make.wordpress.org/core/2020/11/05/application-passwords-integration-guide/',
 				'base_open' => $this->without_enforcement( static fn() => function_exists( 'wp_is_application_passwords_available' ) && wp_is_application_passwords_available() ),
+				'live'      => static fn() => function_exists( 'wp_is_application_passwords_available' ) && wp_is_application_passwords_available(),
 			),
 			'rest_user_enum'   => array(
 				'label'     => __( 'Unauthenticated REST user listing (/wp/v2/users)' ),
-				'why'       => __( 'The REST API shows author usernames to anyone who asks. Closed, attackers no longer get a ready-made list of logins to guess passwords against.' ),
+				'why'       => __( 'The REST API lists author slugs to anyone who asks. Closed, that listing stops. Author archives, the users sitemap and oEmbed still reveal the same slugs, so this does not hide logins on its own.' ),
 				'link'      => 'https://developer.wordpress.org/rest-api/reference/users/',
 				'base_open' => true, // Core default.
+				'live'      => fn() => ! $this->rest_closer || false === has_filter( 'rest_request_before_callbacks', $this->rest_closer ),
 			),
 			'registration'     => array(
 				'label'     => __( 'Open user registration' ),
-				'why'       => __( 'Anyone can create an account from the login page. Closed, spam and probe accounts cannot register themselves.' ),
+				'why'       => __( 'Anyone can create an account from the login page, or from wp-signup.php on a network. Closed, spam and probe accounts cannot register themselves.' ),
 				'link'      => 'https://wordpress.org/documentation/article/settings-general-screen/#membership',
-				'base_open' => $this->without_enforcement( static fn() => (bool) get_option( 'users_can_register' ) ),
+				'base_open' => $this->without_enforcement( array( $this, 'registration_open' ) ),
+				'live'      => array( $this, 'registration_open' ),
 			),
 			'outbound_http'    => array(
 				'label'       => __( 'Outbound HTTP to arbitrary hosts' ),
@@ -172,6 +179,7 @@ final class HP_Prototype {
 				'why'       => __( 'PHP errors are printed into pages. Closed, visitors never see file paths, queries and other details that help an attacker.' ),
 				'link'      => 'https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/#wp_debug_display',
 				'base_open' => $this->display_errors_base(),
+				'live'      => static fn() => in_array( strtolower( trim( (string) ini_get( 'display_errors' ) ) ), array( '1', 'on', 'true', 'yes', 'stdout', 'stderr' ), true ),
 				'fix'       => "define( 'WP_DEBUG_DISPLAY', false );\n// WP_DEBUG_DISPLAY only applies when WP_DEBUG is on; php.ini decides otherwise:\n@ini_set( 'display_errors', '0' );",
 			),
 			'pingbacks'        => array(
@@ -179,8 +187,23 @@ final class HP_Prototype {
 				'why'       => __( 'New posts accept pingbacks and trackbacks from other sites. Closed, the site cannot be used as a reflector in attacks and gets less link spam.' ),
 				'link'      => 'https://wordpress.org/documentation/article/trackbacks-and-pingbacks/',
 				'base_open' => $this->without_enforcement( static fn() => 'open' === get_option( 'default_ping_status' ) ),
+				'live'      => static fn() => 'open' === get_option( 'default_ping_status' ),
 			),
 		);
+	}
+
+	/**
+	 * Whether anyone can sign up. On a network the login form hands off to wp-signup.php, which
+	 * reads the network's "registration" setting instead of users_can_register.
+	 */
+	public function registration_open(): bool {
+		if ( is_multisite() ) {
+			$active = apply_filters( 'wpmu_active_signup', get_site_option( 'registration', 'none' ) );
+			if ( in_array( $active, array( 'user', 'all' ), true ) ) {
+				return true;
+			}
+		}
+		return (bool) get_option( 'users_can_register' );
 	}
 
 	/** Whether PHP displays errors, read once before enforcement so our own ini_set does not hide it. */
@@ -236,8 +259,15 @@ final class HP_Prototype {
 		return $this->posture_default_open( $key, $dial );
 	}
 
-	/** What the dial actually is right now, with enforcement applied. */
+	/**
+	 * What the dial actually is right now. Constant-backed dials are known from the constant;
+	 * everything else is measured live, with every plugin's hooks in place, so a later plugin
+	 * that reopens a feature shows up as drift instead of hiding behind our stored intent.
+	 */
 	public function effective_open( string $key, array $dial ): bool {
+		if ( ! empty( $dial['live'] ) ) {
+			return (bool) call_user_func( $dial['live'] );
+		}
 		if ( ! $dial['base_open'] ) {
 			return false; // Closed by the site itself; we never force things open.
 		}
@@ -258,10 +288,18 @@ final class HP_Prototype {
 		return $drift;
 	}
 
-	/** Runtime enforcement: closes every dial whose desired state is closed. */
+	/**
+	 * Runtime enforcement: closes every dial whose desired state is closed. Constant-backed
+	 * dials are skipped when wp-config.php already settled them. Filter-backed closers are
+	 * installed regardless of what the base state looks like at mu-plugin load, because that
+	 * sample is taken before any other plugin has hooked anything.
+	 */
 	public function enforce(): void {
 		foreach ( $this->dials() as $key => $dial ) {
-			if ( $this->desired_open( $key, $dial ) || $this->pinned( $dial ) || ! $dial['base_open'] ) {
+			if ( $this->desired_open( $key, $dial ) ) {
+				continue;
+			}
+			if ( ! empty( $dial['constant'] ) && ( $this->pinned( $dial ) || ! $dial['base_open'] ) ) {
 				continue;
 			}
 			switch ( $key ) {
@@ -287,7 +325,7 @@ final class HP_Prototype {
 					ini_set( 'display_errors', '0' );
 					break;
 				case 'xmlrpc':
-					add_filter( 'xmlrpc_enabled', fn( $v ) => $this->suspended ? $v : false, 99 );
+					add_filter( 'xmlrpc_enabled', fn( $v ) => $this->suspended ? $v : false, PHP_INT_MAX );
 					if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
 						status_header( 403 );
 						nocache_headers();
@@ -295,14 +333,12 @@ final class HP_Prototype {
 					}
 					break;
 				case 'app_passwords':
-					add_filter( 'wp_is_application_passwords_available', fn( $v ) => $this->suspended ? $v : false, 99 );
+					add_filter( 'wp_is_application_passwords_available', fn( $v ) => $this->suspended ? $v : false, PHP_INT_MAX );
 					break;
 				case 'rest_user_enum':
 					// Route matching in core is case-insensitive, so "/wp/v2/USERS" reaches the users
 					// controller too. Match the path case-insensitively and also the handler itself.
-					add_filter(
-						'rest_request_before_callbacks',
-						function ( $response, $handler, $request ) {
+					$this->rest_closer = function ( $response, $handler, $request ) {
 							if ( $this->suspended || is_wp_error( $response ) || is_user_logged_in() ) {
 								return $response;
 							}
@@ -312,16 +348,29 @@ final class HP_Prototype {
 								return new WP_Error( 'hp_closed', __( 'User listing is closed by the site hardening posture.' ), array( 'status' => 401 ) );
 							}
 							return $response;
-						},
-						10,
-						3
-					);
+					};
+					add_filter( 'rest_request_before_callbacks', $this->rest_closer, PHP_INT_MAX, 3 );
 					break;
 				case 'registration':
-					add_filter( 'option_users_can_register', fn( $v ) => $this->suspended ? $v : 0, 99 );
+					// pre_option_* short-circuits get_option() before option_* filters run, so a later
+					// plugin using it cannot slip past an option_* closer. Use the same lever.
+					add_filter( 'pre_option_users_can_register', fn( $v ) => $this->suspended ? $v : '0', PHP_INT_MAX );
+					if ( is_multisite() ) {
+						// wp-signup.php never reads users_can_register; it asks the network setting through this filter.
+						add_filter(
+							'wpmu_active_signup',
+							function ( $active ) {
+								if ( $this->suspended ) {
+									return $active;
+								}
+								return 'all' === $active ? 'blog' : ( 'user' === $active ? 'none' : $active );
+							},
+							PHP_INT_MAX
+						);
+					}
 					break;
 				case 'pingbacks':
-					add_filter( 'option_default_ping_status', fn( $v ) => $this->suspended ? $v : 'closed', 99 );
+					add_filter( 'pre_option_default_ping_status', fn( $v ) => $this->suspended ? $v : 'closed', PHP_INT_MAX );
 					add_filter( 'xmlrpc_methods', static function ( $m ) { unset( $m['pingback.ping'], $m['pingback.extensions.getPingbacks'] ); return $m; } );
 					break;
 			}
@@ -856,7 +905,7 @@ final class HP_Prototype {
 			$open += $this->effective_open( $key, $dial ) ? 1 : 0;
 		}
 		$blurbs = array(
-			'locked'   => __( 'Everything closes. You open features one by one.' ),
+			'locked'   => __( 'Everything closes except dashboard updates, outbound HTTP and, without HTTPS, plain-HTTP admin. You open the rest one by one.' ),
 			'standard' => __( 'What WordPress ships with. Only your own switches apply.' ),
 			'open'     => __( 'Every feature open. Useful for a dev site.' ),
 		);

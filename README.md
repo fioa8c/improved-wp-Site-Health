@@ -36,7 +36,7 @@ A switch records an override only where it differs from the posture's default, s
 
 Two dials stay open under Locked unless you close them yourself, because closing them has side effects: dashboard installs (it also stops automatic updates) and outbound HTTP (it breaks update checks until `WP_ACCESSIBLE_HOSTS` lists what you need). Plain HTTP admin also stays open on a site that is not served over HTTPS, since forcing SSL there locks you out.
 
-**Drift.** Anything that is still open although it was switched closed is marked as drift on the row and reported as a critical item on the Status tab.
+**Drift.** Anything that is still open although it was switched closed is marked as drift on the row and reported as a critical item on the Status tab. For the filter-backed dials the "right now" column is a live measurement taken with every plugin's hooks in place, not the stored intent, so a plugin that reopens a feature behind the plugin's back shows up as drift.
 
 ### Nine new Site Health status tests
 
@@ -69,6 +69,8 @@ Options used: `hp_posture` (string) and `hp_states` (array of overrides). Delete
 ## How enforcement works
 
 At load the plugin walks the dials that should be closed. For the constant-backed ones it defines the constant unless `wp-config.php` already did. For the rest it hooks filters: `xmlrpc_enabled` plus an early 403 on XML-RPC requests, `wp_is_application_passwords_available`, `rest_pre_dispatch` for unauthenticated user listing, `option_users_can_register`, `option_default_ping_status` and the `pingback.ping` XML-RPC method, and `display_errors` through `ini_set`.
+
+The closers are installed whenever a dial is switched closed, regardless of what the feature looked like at must-use plugin load, and they hook at the highest priority. The two option-backed dials use `pre_option_*`, which short-circuits `get_option()` before any `option_*` filter runs. On a network, registration is also closed through `wpmu_active_signup`, because wp-signup.php never reads `users_can_register`.
 
 The plugin only ever closes things. It never opens a feature that core, `wp-config.php` or the server keeps closed, which is why a dial can show "Closed" while its switch says "Open".
 
