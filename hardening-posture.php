@@ -285,13 +285,20 @@ final class HP_Prototype {
 					add_filter( 'wp_is_application_passwords_available', fn( $v ) => $this->suspended ? $v : false, 99 );
 					break;
 				case 'rest_user_enum':
+					// Route matching in core is case-insensitive, so "/wp/v2/USERS" reaches the users
+					// controller too. Match the path case-insensitively and also the handler itself.
 					add_filter(
-						'rest_pre_dispatch',
-						static function ( $result, $server, $request ) {
-							if ( ! is_user_logged_in() && str_starts_with( $request->get_route(), '/wp/v2/users' ) ) {
+						'rest_request_before_callbacks',
+						function ( $response, $handler, $request ) {
+							if ( $this->suspended || is_wp_error( $response ) || is_user_logged_in() ) {
+								return $response;
+							}
+							$users_route    = (bool) preg_match( '#^/wp/v2/users(/|$)#i', $request->get_route() );
+							$users_callback = is_array( $handler['callback'] ?? null ) && ( $handler['callback'][0] ?? null ) instanceof WP_REST_Users_Controller;
+							if ( $users_route || $users_callback ) {
 								return new WP_Error( 'hp_closed', __( 'User listing is closed by the site hardening posture.' ), array( 'status' => 401 ) );
 							}
-							return $result;
+							return $response;
 						},
 						10,
 						3
