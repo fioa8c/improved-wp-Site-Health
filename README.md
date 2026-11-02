@@ -38,17 +38,20 @@ Two dials stay open under Locked unless you close them yourself, because closing
 
 **Drift.** Anything that is still open although it was switched closed is marked as drift on the row and reported as a critical item on the Status tab.
 
-### Eight new Site Health status tests
+### Nine new Site Health status tests
 
 | Test | What it looks at |
 |---|---|
 | Hardening posture | Dials that drift from the posture you chose |
+| Address bar matches the site address | The host and scheme the browser used against the raw `home` and `siteurl` options; a different host is critical, a different scheme only is recommended |
 | PHP process confinement | `open_basedir`, `disable_functions`, `allow_url_include`, `expose_php`, whether PHP can write to core directories, the built-in dev server |
 | Configuration hygiene | `WP_ENVIRONMENT_TYPE`, secret keys, the `wp_` table prefix, a user named `admin`, `wp-config.php` inside the web root, leftover `readme.html` and `wp-config-sample.php`, the file editor |
 | Database user privileges | `SHOW GRANTS`: all privileges on every database, `FILE`, `SUPER`, `GRANT OPTION`, `@%` hosts, databases reached over the network |
-| Plugins outside the directory | Active plugins that WordPress.org does not track, so no update or closure notices reach the site |
+| Plugins outside the directory | Plugins that WordPress.org does not track, so no update or closure notices reach the site; reports "could not check" instead of guessing when update data is missing |
 | PHP execution in uploads | Writes a probe file into `wp-content/uploads`, fetches it, deletes it |
-| Exposed files | `readme.html`, `license.txt`, `.env`, `wp-config.php` backups, `debug.log`, `.git` and directory listings reachable over HTTP |
+| Exposed files | `readme.html`, `license.txt`, `.env`, `wp-config.php` backups, `debug.log`, `.git` and directory listings reachable over HTTP, each matched on its own signature |
+
+The three tests that request the site over HTTP (uploads probe, exposed files, server hygiene) are registered as async tests with a REST endpoint under `hp/v1/tests/`, the same way core runs its loopback test, so the Status tab never waits on them. The weekly cron calls them directly.
 | Web server hygiene | `Server` and `X-Powered-By` banners, missing security headers, `Strict-Transport-Security` on HTTPS sites, plain-HTTP sites |
 
 ### Security releases reported as critical

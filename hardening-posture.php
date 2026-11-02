@@ -24,6 +24,9 @@ final class HP_Prototype {
 	/** Constants this plugin defined itself (so the base state is still "open"). */
 	private $defined = array();
 
+	/** display_errors as PHP had it before this plugin touched it. */
+	private $display_errors_base;
+
 	public static function boot(): self {
 		if ( ! self::$instance ) {
 			self::$instance = new self();
@@ -37,6 +40,7 @@ final class HP_Prototype {
 		add_filter( 'site_health_navigation_tabs', array( $this, 'register_tab' ) );
 		add_action( 'site_health_tab_content', array( $this, 'render_tab' ) );
 		add_action( 'admin_init', array( $this, 'handle_form' ) );
+		add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
 		// Enforce at mu-plugin load: FORCE_SSL_ADMIN must exist before wp_ssl_constants() runs.
 		$this->enforce();
 	}
@@ -167,8 +171,8 @@ final class HP_Prototype {
 				'label'     => __( 'Errors displayed to visitors' ),
 				'why'       => __( 'PHP errors are printed into pages. Closed, visitors never see file paths, queries and other details that help an attacker.' ),
 				'link'      => 'https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/#wp_debug_display',
-				'base_open' => defined( 'WP_DEBUG' ) && WP_DEBUG && defined( 'WP_DEBUG_DISPLAY' ) && WP_DEBUG_DISPLAY,
-				'fix'       => "define( 'WP_DEBUG_DISPLAY', false );",
+				'base_open' => $this->display_errors_base(),
+				'fix'       => "define( 'WP_DEBUG_DISPLAY', false );\n// WP_DEBUG_DISPLAY only applies when WP_DEBUG is on; php.ini decides otherwise:\n@ini_set( 'display_errors', '0' );",
 			),
 			'pingbacks'        => array(
 				'label'     => __( 'Pingbacks and trackbacks on new posts' ),
@@ -177,6 +181,15 @@ final class HP_Prototype {
 				'base_open' => $this->without_enforcement( static fn() => 'open' === get_option( 'default_ping_status' ) ),
 			),
 		);
+	}
+
+	/** Whether PHP displays errors, read once before enforcement so our own ini_set does not hide it. */
+	private function display_errors_base(): bool {
+		if ( null === $this->display_errors_base ) {
+			$value                     = strtolower( trim( (string) ini_get( 'display_errors' ) ) );
+			$this->display_errors_base = in_array( $value, array( '1', 'on', 'true', 'yes', 'stdout', 'stderr' ), true );
+		}
+		return $this->display_errors_base;
 	}
 
 	/** A constant-backed dial is open unless the constant is truthy, or we defined it ourselves. */
@@ -346,6 +359,9 @@ final class HP_Prototype {
 		$minor   = null;
 		$latest  = null;
 		foreach ( $from_api->updates as $offer ) {
+			if ( 'development' === ( $offer->response ?? '' ) ) {
+				continue; // Nightlies are not releases.
+			}
 			$version = $offer->current ?? ( $offer->version ?? '' );
 			if ( ! $version || ! version_compare( $version, $current, '>' ) ) {
 				continue;
@@ -397,24 +413,56 @@ final class HP_Prototype {
 		return $result;
 	}
 
+	/** Tests that make HTTP requests to the site itself; they run async so the page never waits on them. */
+	const LOOPBACK_TESTS = array( 'upload_exec', 'exposed_files', 'server_hygiene' );
+
 	public function register_tests( array $tests ): array {
-		$direct = array(
-			'hp_posture_drift'   => __( 'Hardening posture' ),
-			'hp_php_confinement' => __( 'PHP process confinement' ),
-			'hp_environment'     => __( 'Configuration hygiene' ),
-			'hp_db_privileges'   => __( 'Database user privileges' ),
-			'hp_supply_chain'    => __( 'Plugins outside the directory' ),
-			'hp_upload_exec'     => __( 'PHP execution in uploads' ),
-			'hp_exposed_files'   => __( 'Exposed files' ),
-			'hp_server_hygiene'  => __( 'Web server hygiene' ),
+		$labels = array(
+			'posture_drift'   => __( 'Hardening posture' ),
+			'url_match'       => __( 'Address bar matches the site address' ),
+			'php_confinement' => __( 'PHP process confinement' ),
+			'environment'     => __( 'Configuration hygiene' ),
+			'db_privileges'   => __( 'Database user privileges' ),
+			'supply_chain'    => __( 'Plugins outside the directory' ),
+			'upload_exec'     => __( 'PHP execution in uploads' ),
+			'exposed_files'   => __( 'Exposed files' ),
+			'server_hygiene'  => __( 'Web server hygiene' ),
 		);
-		foreach ( $direct as $key => $label ) {
-			$tests['direct'][ $key ] = array(
-				'label' => $label,
-				'test'  => array( $this, 'test_' . substr( $key, 3 ) ),
-			);
+		foreach ( $labels as $key => $label ) {
+			if ( in_array( $key, self::LOOPBACK_TESTS, true ) ) {
+				// Same shape as core's loopback test: the browser fetches it, cron calls it directly.
+				$tests['async'][ 'hp_' . $key ] = array(
+					'label'             => $label,
+					'test'              => rest_url( 'hp/v1/tests/' . str_replace( '_', '-', $key ) ),
+					'has_rest'          => true,
+					'async_direct_test' => array( $this, 'test_' . $key ),
+				);
+			} else {
+				$tests['direct'][ 'hp_' . $key ] = array(
+					'label' => $label,
+					'test'  => array( $this, 'test_' . $key ),
+				);
+			}
 		}
 		return $tests;
+	}
+
+	public function register_rest_routes(): void {
+		register_rest_route(
+			'hp/v1',
+			'/tests/(?P<test>[a-z-]+)',
+			array(
+				'methods'             => 'GET',
+				'permission_callback' => static fn() => current_user_can( 'view_site_health_checks' ),
+				'callback'            => function ( WP_REST_Request $request ) {
+					$key = str_replace( '-', '_', $request['test'] );
+					if ( ! in_array( $key, self::LOOPBACK_TESTS, true ) ) {
+						return new WP_Error( 'rest_no_route', __( 'No such test.' ), array( 'status' => 404 ) );
+					}
+					return rest_ensure_response( $this->{'test_' . $key}() );
+				},
+			)
+		);
 	}
 
 	private function result( string $test, string $label, string $status, string $desc, string $actions = '' ): array {
@@ -452,15 +500,68 @@ final class HP_Prototype {
 		);
 	}
 
+	/**
+	 * The host and scheme the browser used must be the ones in Settings > General. When they
+	 * differ, the server answers under names WordPress does not know about (host-header
+	 * injection, cache poisoning, password-reset links to the wrong host) or sits behind a
+	 * proxy whose HTTPS WordPress cannot see (insecure cookies, redirect loops).
+	 */
+	public function test_url_match(): array {
+		$host = strtolower( trim( (string) ( $_SERVER['HTTP_HOST'] ?? '' ) ) );
+		if ( '' === $host || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+			return $this->result( 'url_match', __( 'The address bar check runs when Site Health is opened in a browser' ), 'good', '<p>' . __( 'This run had no browser request to compare against.' ) . '</p>' );
+		}
+		$normalize = static function ( string $scheme, string $host ): string {
+			$scheme = strtolower( $scheme );
+			$host   = strtolower( $host );
+			if ( str_ends_with( $host, 'http' === $scheme ? ':80' : ':443' ) ) {
+				$host = substr( $host, 0, strrpos( $host, ':' ) );
+			}
+			return $scheme . '://' . $host;
+		};
+		$seen      = $normalize( is_ssl() ? 'https' : 'http', $host );
+		$mismatch  = array();
+		$host_diff = false;
+		// Raw options, not home_url(): that helper already swaps in https on an SSL request.
+		foreach ( array( __( 'Site Address (URL)' ) => get_option( 'home' ), __( 'WordPress Address (URL)' ) => get_option( 'siteurl' ) ) as $setting => $url ) {
+			$u          = wp_parse_url( (string) $url );
+			$configured = $normalize( $u['scheme'] ?? 'http', ( $u['host'] ?? '' ) . ( isset( $u['port'] ) ? ':' . $u['port'] : '' ) );
+			if ( $configured !== $seen ) {
+				$mismatch[] = sprintf( __( '%1$s is <code>%2$s</code>, the browser used <code>%3$s</code>.' ), $setting, esc_html( $configured ), esc_html( $seen ) );
+				if ( substr( $configured, strpos( $configured, '://' ) ) !== substr( $seen, strpos( $seen, '://' ) ) ) {
+					$host_diff = true;
+				}
+			}
+		}
+		if ( ! $mismatch ) {
+			return $this->result( 'url_match', __( 'The address bar matches the configured site address' ), 'good', sprintf( '<p>' . __( 'This page was requested as <code>%s</code>, which is the address WordPress is configured with.' ) . '</p>', esc_html( $seen ) ) );
+		}
+		return $this->result(
+			'url_match',
+			$host_diff ? __( 'The site is reachable under an address it is not configured for' ) : __( 'The site is configured with a different scheme than the browser used' ),
+			$host_diff ? 'critical' : 'recommended',
+			'<p>' . __( 'WordPress builds links, cookies, redirects and password-reset emails from the configured address. Answering under another one means the web server accepts any Host header, or a proxy in front hides the real scheme.' ) . '</p>' . $this->list_html( $mismatch ),
+			'<p>' . sprintf( __( 'Fix the addresses under <a href="%s">Settings &rsaquo; General</a>, make the web server answer only for the configured host, and if a proxy terminates HTTPS, tell WordPress about it with <code>HTTP_X_FORWARDED_PROTO</code> handling in wp-config.php.' ), esc_url( admin_url( 'options-general.php' ) ) ) . '</p>'
+		);
+	}
+
 	public function test_php_confinement(): array {
 		$issues = array();
 		$good   = array();
 
 		$ob = ini_get( 'open_basedir' );
-		$ob ? $good[] = 'open_basedir = <code>' . esc_html( $ob ) . '</code>' : $issues[] = __( '<code>open_basedir</code> is not set: PHP can read any file the process user can.' );
+		if ( $ob ) {
+			$good[] = 'open_basedir = <code>' . esc_html( $ob ) . '</code>';
+		} else {
+			$issues[] = __( '<code>open_basedir</code> is not set: PHP can read any file the process user can.' );
+		}
 
 		$df = ini_get( 'disable_functions' );
-		$df ? $good[] = 'disable_functions = <code>' . esc_html( $df ) . '</code>' : $issues[] = __( '<code>disable_functions</code> is empty: <code>exec</code>, <code>shell_exec</code>, <code>proc_open</code> are all callable.' );
+		if ( $df ) {
+			$good[] = 'disable_functions = <code>' . esc_html( $df ) . '</code>';
+		} else {
+			$issues[] = __( '<code>disable_functions</code> is empty: <code>exec</code>, <code>shell_exec</code>, <code>proc_open</code> are all callable.' );
+		}
 
 		if ( filter_var( ini_get( 'allow_url_include' ), FILTER_VALIDATE_BOOLEAN ) ) {
 			$issues[] = __( '<code>allow_url_include</code> is on: remote file inclusion is one bug away.' );
@@ -511,7 +612,8 @@ final class HP_Prototype {
 		if ( file_exists( ABSPATH . 'wp-config-sample.php' ) || file_exists( ABSPATH . 'readme.html' ) ) {
 			$issues[] = __( '<code>wp-config-sample.php</code> or <code>readme.html</code> still ship with the install and reveal the version.' );
 		}
-		if ( ! defined( 'DISALLOW_FILE_EDIT' ) || ! DISALLOW_FILE_EDIT ) {
+		$dials = $this->dials();
+		if ( $this->effective_open( 'file_editor', $dials['file_editor'] ) ) {
 			$issues[] = __( 'The theme and plugin file editor is enabled.' );
 		}
 		if ( get_user_by( 'login', 'admin' ) ) {
@@ -558,6 +660,13 @@ final class HP_Prototype {
 		}
 		$plugins = get_plugins();
 		$update  = get_site_transient( 'update_plugins' );
+		if ( empty( $update->last_checked ) ) {
+			wp_update_plugins();
+			$update = get_site_transient( 'update_plugins' );
+		}
+		if ( empty( $update->last_checked ) ) {
+			return $this->result( 'supply_chain', __( 'Could not check plugins against the directory' ), 'recommended', '<p>' . __( 'WordPress has not been able to ask WordPress.org about installed plugins yet, so untracked plugins cannot be told apart from tracked ones.' ) . '</p>' );
+		}
 		$known   = array_merge( array_keys( (array) ( $update->response ?? array() ) ), array_keys( (array) ( $update->no_update ?? array() ) ) );
 		$orphans = array();
 		foreach ( $plugins as $file => $data ) {
@@ -590,7 +699,12 @@ final class HP_Prototype {
 		$marker  = 'HP_EXEC_' . wp_generate_password( 12, false );
 		$name    = 'hp-probe-' . wp_generate_password( 16, false ) . '.php';
 		$path    = trailingslashit( $uploads['basedir'] ) . $name;
-		$url     = trailingslashit( $uploads['baseurl'] ) . $name;
+		// Request the probe from this server, not from a CDN that media plugins put into baseurl.
+		$abspath = trailingslashit( wp_normalize_path( ABSPATH ) );
+		$local   = wp_normalize_path( $path );
+		$url     = str_starts_with( $local, $abspath )
+			? site_url( '/' . substr( $local, strlen( $abspath ) ) )
+			: trailingslashit( $uploads['baseurl'] ) . $name;
 
 		if ( false === @file_put_contents( $path, "<?php echo '" . $marker . "';" ) ) {
 			return $this->result( 'upload_exec', __( 'Could not write a probe into the uploads directory' ), 'recommended', '<p>' . __( 'The check needs to drop a one-line PHP file into uploads and request it.' ) . '</p>' );
@@ -608,22 +722,25 @@ final class HP_Prototype {
 	}
 
 	public function test_exposed_files(): array {
+		// Core files live under site_url(), not home_url(), on subdirectory installs; wp-content can be
+		// relocated, so its probes go through content_url(). Matchers look for each file's own
+		// signature so a host that answers 200 for unknown paths does not light everything up.
+		$listing = static fn( $b ) => (bool) preg_match( '#<title>\s*Index of#i', $b );
 		$targets = array(
-			'wp-config.php'        => static fn( $b ) => str_contains( $b, 'DB_NAME' ),
-			'wp-config.php.bak'    => static fn( $b ) => str_contains( $b, 'DB_NAME' ),
-			'wp-config.php~'       => static fn( $b ) => str_contains( $b, 'DB_NAME' ),
-			'.env'                 => static fn( $b ) => (bool) preg_match( '/^[A-Z_]+=/m', $b ),
-			'.git/HEAD'            => static fn( $b ) => str_starts_with( $b, 'ref:' ),
-			'wp-content/debug.log' => static fn( $b ) => str_contains( $b, 'PHP ' ) || str_contains( $b, '[' ),
-			'readme.html'          => static fn( $b ) => str_contains( $b, 'Version' ),
-			'license.txt'          => static fn( $b ) => str_contains( $b, 'GNU' ),
-			'xmlrpc.php'           => static fn( $b ) => str_contains( $b, 'XML-RPC server accepts POST requests only' ),
-			'wp-content/uploads/'  => static fn( $b ) => str_contains( $b, 'Index of' ),
-			'wp-includes/'         => static fn( $b ) => str_contains( $b, 'Index of' ),
+			'wp-config.php'     => array( site_url( '/wp-config.php' ), static fn( $b ) => str_contains( $b, 'DB_NAME' ) ),
+			'wp-config.php.bak' => array( site_url( '/wp-config.php.bak' ), static fn( $b ) => str_contains( $b, 'DB_NAME' ) ),
+			'wp-config.php~'    => array( site_url( '/wp-config.php~' ), static fn( $b ) => str_contains( $b, 'DB_NAME' ) ),
+			'.env'              => array( site_url( '/.env' ), static fn( $b ) => (bool) preg_match( '/^[A-Z_][A-Z0-9_]*=/m', $b ) ),
+			'.git/HEAD'         => array( site_url( '/.git/HEAD' ), static fn( $b ) => str_starts_with( $b, 'ref:' ) ),
+			'debug.log'         => array( content_url( '/debug.log' ), static fn( $b ) => (bool) preg_match( '/^\[\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2} [A-Z]+\]/m', $b ) ),
+			'readme.html'       => array( site_url( '/readme.html' ), static fn( $b ) => str_contains( $b, 'WordPress &#8250; ReadMe' ) ),
+			'license.txt'       => array( site_url( '/license.txt' ), static fn( $b ) => str_contains( $b, 'WordPress - Web publishing software' ) ),
+			'uploads/'          => array( content_url( '/uploads/' ), $listing ),
+			'wp-includes/'      => array( site_url( '/wp-includes/' ), $listing ),
 		);
 		$exposed = array();
-		foreach ( $targets as $rel => $matches ) {
-			$res = $this->fetch( home_url( '/' . $rel ) );
+		foreach ( $targets as $rel => [ $url, $matches ] ) {
+			$res = $this->fetch( $url );
 			if ( 200 === $res['code'] && $matches( $res['body'] ) ) {
 				$exposed[] = '<code>' . esc_html( $rel ) . '</code>';
 			}
@@ -665,7 +782,11 @@ final class HP_Prototype {
 			}
 		}
 		if ( is_ssl() || str_starts_with( home_url(), 'https://' ) ) {
-			empty( $h['strict-transport-security'] ) ? $issues[] = __( 'Missing <code>Strict-Transport-Security</code> on an HTTPS site.' ) : $good[] = '<code>strict-transport-security</code>';
+			if ( empty( $h['strict-transport-security'] ) ) {
+				$issues[] = __( 'Missing <code>Strict-Transport-Security</code> on an HTTPS site.' );
+			} else {
+				$good[] = '<code>strict-transport-security</code>';
+			}
 		} else {
 			$issues[] = __( 'The site is served over plain HTTP, so every cookie and password crosses the wire in clear text.' );
 		}
